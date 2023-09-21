@@ -12,18 +12,22 @@
  * the License.
  */
 /* eslint-disable no-underscore-dangle */
-// test
 const kebabCase = require('lodash/kebabCase');
 const merge = require('lodash/merge');
 const path = require('path');
 const Chalk = require('chalk').Instance;
 const { diffImageToSnapshot, runDiffImageToSnapshot } = require('./diff-snapshot');
 const fs = require('fs');
+const childProc = require('child_process');
 const OutdatedSnapshotReporter = require('./outdated-snapshot-reporter');
+const notifier = require('node-notifier');
+const { Confirm } = require('enquirer');
 
 const timesCalled = new Map();
 
 const SNAPSHOTS_DIR = '__image_snapshots__';
+const DIFF_DIR = '__diff_output';
+const RECEIVED_DIR = '__received_snapshots__';
 
 function updateSnapshotState(originalSnapshotState, partialSnapshotState) {
   if (global.UNSTABLE_SKIP_REPORTING) {
@@ -107,9 +111,11 @@ function createSnapshotIdentifier({
   snapshotState,
 }) {
   const counter = snapshotState._counters.get(currentTestName);
+  const dirName = currentTestName.split('...');
+  const itTitle = dirName[1];
   const defaultIdentifier = kebabCase(`${path.basename(testPath)}-${currentTestName}-${counter}`);
 
-  let snapshotIdentifier = customSnapshotIdentifier || `${defaultIdentifier}-snap`;
+  let snapshotIdentifier = customSnapshotIdentifier || `${itTitle}-snap`;
 
   if (typeof customSnapshotIdentifier === 'function') {
     const customRes = customSnapshotIdentifier({
@@ -136,9 +142,9 @@ function configureToMatchImageSnapshot({
   customDiffConfig: commonCustomDiffConfig = {},
   customSnapshotIdentifier: commonCustomSnapshotIdentifier,
   customSnapshotsDir: commonCustomSnapshotsDir,
-  storeReceivedOnFailure: commonStoreReceivedOnFailure = false,
+  storeReceivedOnFailure: commonStoreReceivedOnFailure = true,
   customReceivedDir: commonCustomReceivedDir,
-  customReceivedPostfix: commonCustomReceivedPostfix,
+  customReceivedPostfix: commonCustomReceivedPostfix = '-received',
   customDiffDir: commonCustomDiffDir,
   onlyDiff: commonOnlyDiff = false,
   diffDirection: commonDiffDirection = 'horizontal',
@@ -153,7 +159,7 @@ function configureToMatchImageSnapshot({
   allowSizeMismatch: commonAllowSizeMismatch = false,
   comparisonMethod: commonComparisonMethod = 'pixelmatch',
 } = {}) {
-  return function toMatchImageSnapshot(received, {
+  return async function toMatchImageSnapshot(received, {
     customSnapshotIdentifier = commonCustomSnapshotIdentifier,
     customSnapshotsDir = commonCustomSnapshotsDir,
     storeReceivedOnFailure = commonStoreReceivedOnFailure,
@@ -198,10 +204,12 @@ function configureToMatchImageSnapshot({
       snapshotState,
     });
 
-    const snapshotsDir = customSnapshotsDir || path.join(path.dirname(testPath), SNAPSHOTS_DIR);
-    const receivedDir = customReceivedDir;
+    const dirName = currentTestName.split('...');
+    const describeName = dirName[0];
+    const snapshotsDir = customSnapshotsDir || path.join(path.dirname(testPath), SNAPSHOTS_DIR, kebabCase(describeName));
+    const receivedDir = customReceivedDir || path.join(path.dirname(testPath), RECEIVED_DIR, kebabCase(describeName));
+    const diffDir = customDiffDir || path.join(path.dirname(testPath), DIFF_DIR, kebabCase(describeName));
     const receivedPostfix = customReceivedPostfix;
-    const diffDir = customDiffDir;
     const baselineSnapshotPath = path.join(snapshotsDir, `${snapshotIdentifier}.png`);
     OutdatedSnapshotReporter.markTouchedFile(baselineSnapshotPath);
 
@@ -216,7 +224,7 @@ function configureToMatchImageSnapshot({
 
     const imageToSnapshot = runInProcess ? diffImageToSnapshot : runDiffImageToSnapshot;
 
-    const result =
+    let result =
       imageToSnapshot({
         receivedImageBuffer: received,
         snapshotsDir,
@@ -236,6 +244,50 @@ function configureToMatchImageSnapshot({
         allowSizeMismatch,
         comparisonMethod,
       });
+
+    if (fs.syncExists(path.join(receivedDir, `${snapshotIdentifier}${receivedPostfix}.png`))) {
+
+      await notifier.notify({
+        title: 'Snapshot test failed!',
+        message: `Received diff for ${currentTestName}`,
+        wait: false,
+        timeout: false,
+        sound: true,
+      });
+
+      process.stdout.write(`\n${chalk.bgCyan(`Received difference for ${currentTestName}`)}\n`);
+
+      const viewTimeout = new Promise((resolve) => {
+        setTimeout(resolve, 60000);
+      }).then((() => false));
+      const view = new Confirm({
+        name: 'View Question',
+        message: 'Do you want to view the diff in your browser?',
+      });
+      const viewPromise = view.run();
+      const viewAction = await Promise.race([viewTimeout, viewPromise]);
+      if (viewAction) {
+        childProc.exec(`open -a "Google Chrome file://${diffDir}/${snapshotIdentifier}-diff.png`);
+      } else {
+        view.stop();
+      }
+
+      const updateTimeout = new Promise((resolve) => {
+        setTimeout(resolve, 60000);
+      }).then((() => false));
+      const update = new Confirm({
+        name: 'Update Question',
+        message: `Do you want to update ${snapshotIdentifier}?`,
+      });
+      const updatePromise = update.run();
+      const updateAction = await Promise.race([updateTimeout, updatePromise]);
+      if (updateAction) {
+        fs.renameSync(path.join(receivedDir, `${snapshotIdentifier}${receivedPostfix}.png`), path.join(snapshotsDir, `${snapshotIdentifier}.png`));
+        result = { updated: true };
+      } else {
+        update.stop();
+      }
+    }
 
     return checkResult({
       result,
